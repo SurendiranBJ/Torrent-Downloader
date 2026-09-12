@@ -1,0 +1,160 @@
+const express = require('express');
+const http = require('http');
+const path = require('path');
+const fs = require('fs');
+const multer = require('multer');
+const { Server } = require('socket.io');
+const WebTorrent = require('webtorrent');
+
+const app = express();
+const server = http.createServer(app);
+const io = new Server(server);
+
+const DOWNLOAD_DIR = path.join(__dirname, 'downloads');
+if (!fs.existsSync(DOWNLOAD_DIR)) fs.mkdirSync(DOWNLOAD_DIR, { recursive: true });
+
+// High-speed client settings: more concurrent connections per torrent,
+// and a FIXED port so you can forward it on your router (huge for speed —
+// without this, peers behind NAT/firewalls can't connect back to you).
+const TORRENT_PORT = process.env.TORRENT_PORT ? parseInt(process.env.TORRENT_PORT) : 51413;
+
+const client = new WebTorrent({
+  maxConns: 200,        // more peer connections = more speed
+  downloadLimit: -1,    // unlimited
+  uploadLimit: -1,
+  torrentPort: TORRENT_PORT,
+  dhtPort: TORRENT_PORT,
+  utp: true
+});
+
+app.use(express.json());
+app.use(express.static(path.join(__dirname, 'public')));
+app.use('/downloads', express.static(DOWNLOAD_DIR));
+
+const upload = multer({ dest: path.join(__dirname, 'tmp') });
+
+// Track active torrents by infoHash
+const torrents = {}; // infoHash -> { torrent, addedAt }
+
+function serializeTorrent(t) {
+  return {
+    infoHash: t.infoHash,
+    name: t.name || 'Fetching metadata...',
+    progress: t.progress,
+    downloadSpeed: t.downloadSpeed,
+    uploadSpeed: t.uploadSpeed,
+    numPeers: t.numPeers,
+    numSeeds: (t.wires || []).filter(w => w.peerPieces && w.peerPieces.buffer &&
+      t.pieces && w.peerPieces.buffer.filter(b => b !== 0xff).length === 0).length,
+    length: t.length || 0,
+    downloaded: t.downloaded || 0,
+    done: t.done,
+    timeRemaining: t.timeRemaining,
+    files: (t.files || []).map(f => ({ name: f.name, length: f.length, path: f.path }))
+  };
+}
+
+function addTorrentCommon(source) {
+  // Avoid duplicate adds
+  const existing = client.torrents.find(t =>
+    (t.magnetURI && t.magnetURI === source) || t.infoHash === source
+  );
+  if (existing) return existing;
+
+  const torrent = client.add(source, { path: DOWNLOAD_DIR });
+  registerTorrentEvents(torrent);
+  return torrent;
+}
+
+function registerTorrentEvents(torrent) {
+  torrents[torrent.infoHash] = torrent;
+
+  torrent.on('done', () => {
+    io.emit('torrent-update', serializeTorrent(torrent));
+    io.emit('torrent-done', torrent.infoHash);
+  });
+
+  torrent.on('error', (err) => {
+    io.emit('torrent-error', { infoHash: torrent.infoHash, message: err.message });
+  });
+}
+
+// Broadcast progress for all torrents every second
+setInterval(() => {
+  const list = client.torrents.map(serializeTorrent);
+  io.emit('torrents-list', list);
+}, 1000);
+
+// Add via magnet URI
+app.post('/api/add-magnet', (req, res) => {
+  const { magnet } = req.body;
+  if (!magnet || !magnet.startsWith('magnet:')) {
+    return res.status(400).json({ error: 'Invalid magnet URI' });
+  }
+  try {
+    const torrent = addTorrentCommon(magnet.trim());
+    torrent.once('metadata', () => {
+      io.emit('torrent-update', serializeTorrent(torrent));
+    });
+    res.json({ ok: true, infoHash: torrent.infoHash });
+  } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
+});
+
+// Add via uploaded .torrent file
+app.post('/api/add-file', upload.single('torrentFile'), (req, res) => {
+  if (!req.file) return res.status(400).json({ error: 'No file uploaded' });
+  try {
+    const buf = fs.readFileSync(req.file.path);
+    const torrent = addTorrentCommon(buf);
+    torrent.once('metadata', () => {
+      io.emit('torrent-update', serializeTorrent(torrent));
+    });
+    fs.unlink(req.file.path, () => {});
+    res.json({ ok: true, infoHash: torrent.infoHash });
+  } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
+});
+
+// List current torrents
+app.get('/api/torrents', (req, res) => {
+  res.json(client.torrents.map(serializeTorrent));
+});
+
+// Pause / resume / remove
+app.post('/api/torrents/:infoHash/pause', (req, res) => {
+  const t = client.get(req.params.infoHash);
+  if (!t) return res.status(404).json({ error: 'Not found' });
+  t.pause();
+  res.json({ ok: true });
+});
+
+app.post('/api/torrents/:infoHash/resume', (req, res) => {
+  const t = client.get(req.params.infoHash);
+  if (!t) return res.status(404).json({ error: 'Not found' });
+  t.resume();
+  res.json({ ok: true });
+});
+
+app.delete('/api/torrents/:infoHash', (req, res) => {
+  const t = client.get(req.params.infoHash);
+  if (!t) return res.status(404).json({ error: 'Not found' });
+  const removeFiles = req.query.removeFiles === 'true';
+  t.destroy({ destroyStore: removeFiles }, () => {
+    delete torrents[req.params.infoHash];
+    res.json({ ok: true });
+  });
+});
+
+io.on('connection', (socket) => {
+  socket.emit('torrents-list', client.torrents.map(serializeTorrent));
+});
+
+const PORT = process.env.PORT || 3000;
+server.listen(PORT, () => {
+  console.log(`Torrent downloader running at http://localhost:${PORT}`);
+  console.log(`Files save to: ${DOWNLOAD_DIR}`);
+  console.log(`Torrent peer port: ${TORRENT_PORT} (TCP+UDP) — forward this on your router for best speed`);
+});

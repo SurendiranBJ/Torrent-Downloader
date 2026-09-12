@@ -1,0 +1,13 @@
+# Dependencies
+node_modules/
+
+# Downloaded files & temporary uploads
+downloads/*
+!downloads/.gitkeep
+tmp/*
+!tmp/.gitkeep
+
+# Logs and system files
+*.log
+.DS_Store
+Thumbs.db
