@@ -1,0 +1,144 @@
+version: '3.8'
+
+services:
+  postgres:
+    image: postgres:16-alpine
+    container_name: torrent-postgres
+    restart: unless-stopped
+    environment:
+      POSTGRES_DB: torrent_db
+      POSTGRES_USER: postgres
+      POSTGRES_PASSWORD: postgrespassword
+    ports:
+      - "5432:5432"
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U postgres -d torrent_db"]
+      interval: 5s
+      timeout: 5s
+      retries: 5
+
+  redis:
+    image: redis:7-alpine
+    container_name: torrent-redis
+    restart: unless-stopped
+    ports:
+      - "6379:6379"
+    volumes:
+      - redis_data:/data
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 5s
+      timeout: 5s
+      retries: 5
+
+  minio:
+    image: minio/minio:latest
+    container_name: torrent-minio
+    restart: unless-stopped
+    command: server /data --console-address ":9001"
+    environment:
+      MINIO_ROOT_USER: minioadmin
+      MINIO_ROOT_PASSWORD: minioadmin
+    ports:
+      - "9000:9000"
+      - "9001:9001"
+    volumes:
+      - minio_data:/data
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:9000/minio/health/live"]
+      interval: 5s
+      timeout: 5s
+      retries: 5
+
+  createbuckets:
+    image: minio/mc:latest
+    container_name: torrent-createbuckets
+    depends_on:
+      minio:
+        condition: service_healthy
+    entrypoint: >
+      /bin/sh -c "
+      /usr/bin/mc alias set myminio http://minio:9000 minioadmin minioadmin;
+      /usr/bin/mc mb myminio/torrent-completed || true;
+      /usr/bin/mc anonymous set download myminio/torrent-completed;
+      exit 0;
+      "
+
+  transmission:
+    image: lscr.io/linuxserver/transmission:latest
+    container_name: torrent-transmission
+    restart: unless-stopped
+    environment:
+      PUID: 1000
+      PGID: 1000
+      TZ: UTC
+      TRANSMISSION_DOWNLOAD_DIR: /downloads
+      TRANSMISSION_INCOMPLETE_DIR: /incomplete
+      PEERPORT: ${TRANSMISSION_PEER_PORT:-51413}
+    volumes:
+      - ./data/transmission/downloads:/downloads
+      - ./data/transmission/incomplete:/incomplete
+      - transmission_config:/config
+    ports:
+      - "9091:9091"
+      - "${TRANSMISSION_PEER_PORT:-51413}:${TRANSMISSION_PEER_PORT:-51413}/tcp"
+      - "${TRANSMISSION_PEER_PORT:-51413}:${TRANSMISSION_PEER_PORT:-51413}/udp"
+
+  api:
+    build:
+      context: .
+      dockerfile: apps/api/Dockerfile
+    container_name: torrent-api
+    restart: unless-stopped
+    environment:
+      NODE_ENV: production
+      PORT: 4000
+      DATABASE_URL: postgresql://postgres:postgrespassword@postgres:5432/torrent_db?schema=public
+      REDIS_URL: redis://redis:6379
+      JWT_SECRET: super-secret-jwt-key-replace-in-production-min-32-chars
+      JWT_REFRESH_SECRET: super-secret-jwt-refresh-key-replace-in-production-min-32-chars
+      TRANSMISSION_HOST: transmission
+      TRANSMISSION_RPC_PORT: 9091
+      TRANSMISSION_PEER_PORT: ${TRANSMISSION_PEER_PORT:-51413}
+      STORAGE_ENDPOINT: http://minio:9000
+      STORAGE_BUCKET: torrent-completed
+      STORAGE_ACCESS_KEY: minioadmin
+      STORAGE_SECRET_KEY: minioadmin
+      STORAGE_REGION: us-east-1
+      DOWNLOAD_DIR: /downloads
+      INCOMPLETE_DIR: /incomplete
+    ports:
+      - "4000:4000"
+    volumes:
+      - ./data/transmission/downloads:/downloads
+      - ./data/transmission/incomplete:/incomplete
+    depends_on:
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+      minio:
+        condition: service_healthy
+
+  web:
+    build:
+      context: .
+      dockerfile: apps/web/Dockerfile
+    container_name: torrent-web
+    restart: unless-stopped
+    environment:
+      NODE_ENV: production
+      PORT: 3000
+      NEXT_PUBLIC_API_URL: http://localhost:4000
+    ports:
+      - "3000:3000"
+    depends_on:
+      - api
+
+volumes:
+  postgres_data:
+  redis_data:
+  minio_data:
+  transmission_config:
