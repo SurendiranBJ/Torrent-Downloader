@@ -102,11 +102,17 @@ services:
       TRANSMISSION_HOST: transmission
       TRANSMISSION_RPC_PORT: 9091
       TRANSMISSION_PEER_PORT: ${TRANSMISSION_PEER_PORT:-51413}
-      STORAGE_ENDPOINT: http://minio:9000
-      STORAGE_BUCKET: torrent-completed
-      STORAGE_ACCESS_KEY: minioadmin
-      STORAGE_SECRET_KEY: minioadmin
-      STORAGE_REGION: us-east-1
+      # Storage Provider: "s3" for AWS S3 or "minio" for local container
+      STORAGE_PROVIDER: ${STORAGE_PROVIDER:-s3}
+      AWS_REGION: ${AWS_REGION:-us-east-1}
+      AWS_ACCESS_KEY_ID: ${AWS_ACCESS_KEY_ID:-}
+      AWS_SECRET_ACCESS_KEY: ${AWS_SECRET_ACCESS_KEY:-}
+      AWS_S3_BUCKET: ${AWS_S3_BUCKET:-torrent-completed}
+      AWS_S3_STORAGE_CLASS: ${AWS_S3_STORAGE_CLASS:-INTELLIGENT_TIERING}
+      STORAGE_ENDPOINT: ${STORAGE_ENDPOINT:-}
+      STORAGE_BUCKET: ${STORAGE_BUCKET:-torrent-completed}
+      STORAGE_ACCESS_KEY: ${STORAGE_ACCESS_KEY:-minioadmin}
+      STORAGE_SECRET_KEY: ${STORAGE_SECRET_KEY:-minioadmin}
       DOWNLOAD_DIR: /downloads
       INCOMPLETE_DIR: /incomplete
     ports:
@@ -118,8 +124,6 @@ services:
       postgres:
         condition: service_healthy
       redis:
-        condition: service_healthy
-      minio:
         condition: service_healthy
 
   web:
