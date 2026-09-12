@@ -60,12 +60,15 @@ export class StorageWorker {
       });
     } catch {}
 
-    // Step 2: Upload to S3 / MinIO
-    const storageKey = `torrents/${userId}/${infoHash}/${path.basename(filePath)}`;
+    // Step 2: Upload to S3 under users/<userId>/torrents/<torrentId>/<fileName>
+    const prefix = process.env.S3_PREFIX || 'users/';
+    const cleanPrefix = prefix.endsWith('/') ? prefix : `${prefix}/`;
+    const storageKey = `${cleanPrefix}${userId}/torrents/${torrentId}/${path.basename(filePath)}`;
+
     await this.storageService.upload(filePath, storageKey);
 
-    // Step 3: Generate initial signed URL (expires in 24 hours)
-    const expiresSeconds = 86400;
+    // Step 3: Generate pre-signed URL (15 minutes / 900 seconds)
+    const expiresSeconds = 900;
     const signedUrl = await this.storageService.getSignedUrl(storageKey, expiresSeconds);
     const expiresAt = new Date(Date.now() + expiresSeconds * 1000);
 

@@ -243,12 +243,12 @@ router.get('/:id/download', async (req: AuthenticatedRequest, res: Response) => 
       if (torrent.downloadUrl && torrent.urlExpiresAt && torrent.urlExpiresAt > new Date()) {
         return res.json({ downloadUrl: torrent.downloadUrl, type: 's3' });
       }
-      const newSignedUrl = await defaultStorageService.getSignedUrl(torrent.storageKey, 3600);
+      const newSignedUrl = await defaultStorageService.getSignedUrl(torrent.storageKey, 900);
       await prisma.torrent.update({
         where: { id },
         data: {
           downloadUrl: newSignedUrl,
-          urlExpiresAt: new Date(Date.now() + 3600 * 1000)
+          urlExpiresAt: new Date(Date.now() + 900 * 1000)
         }
       });
       return res.json({ downloadUrl: newSignedUrl, type: 's3' });

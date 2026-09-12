@@ -7,9 +7,12 @@ export function getSocket(): Socket | null {
 
   if (!socket) {
     const token = localStorage.getItem('token');
-    const serverUrl = process.env.NEXT_PUBLIC_API_URL || 'http://localhost:4000';
+    const serverUrl =
+      process.env.NEXT_PUBLIC_API_URL !== undefined && process.env.NEXT_PUBLIC_API_URL !== ''
+        ? process.env.NEXT_PUBLIC_API_URL
+        : undefined;
 
-    socket = io(serverUrl, {
+    socket = io(serverUrl as any, {
       auth: { token },
       withCredentials: true,
       transports: ['websocket', 'polling']

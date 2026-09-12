@@ -1,103 +1,133 @@
-# Torrent Downloader: Local Windows Architecture + AWS S3
+# AWS EC2 Torrent Downloader (Ubuntu 24.04 LTS)
 
-> **Branch**: `Torrent-AWS-S3`  
-> Configured with native **Amazon Web Services (AWS) S3** object storage integration, high-concurrency multipart streaming uploads, and automated pre-signed download links.
+> **Cloud-Native Architecture**: Runs 100% inside **Amazon Web Services (AWS) EC2**, downloading torrents directly from the swarm using AWS network capacity and dedicated EBS storage. The user's home computer is **never** part of the BitTorrent swarm—it is only used to open the web dashboard (`http://EC2_PUBLIC_IP/`) and download completed files via Amazon S3.
 
-A production-grade, local Windows torrent management platform built for maximum swarm throughput, robust multi-tenant security, and automated cloud storage offloading to **AWS S3**.
-
-Powered by **Transmission** (as the exclusive torrent engine), **Turborepo**, **Next.js 16**, **Express**, **Prisma (PostgreSQL)**, **Redis**, **BullMQ**, and **AWS S3**.
+Built with **Transmission** (exclusive torrent engine), **Next.js 16 App Router**, **Express API**, **Prisma (PostgreSQL)**, **Redis**, **BullMQ**, and **Amazon S3**.
 
 ---
 
-## 1. Architecture: Torrent + AWS S3
+## 1. Cloud Architecture Overview
 
 ```text
-                                WINDOWS PC (Local)
-┌─────────────────────────────────────────────────────────────────────────────┐
-│                                                                             │
-│                               Browser UI                                    │
-│                     (Next.js App Router + React + Tailwind)                  │
-│                                   │                                         │
-│                      HTTP / REST  │  Socket.IO (Authenticated user rooms)   │
-│                                   ▼                                         │
-│                         Express API Server                                  │
-│             (JWT Auth, Multi-tenant DB, Diagnostics, Polling Cache)         │
-│                        │                      │                             │
-│       Transmission RPC │                      │ Enqueue completed jobs      │
-│                        ▼                      ▼                             │
-│              Transmission Daemon        Redis + BullMQ                      │
-│             (Peer Port 51413 TCP/UDP)         │                             │
-│                        │                      ▼                             │
-│                  Torrent Swarm          Storage Worker                      │
-│                 (DHT, PEX, Trackers)          │                             │
-│                        │                      ▼                             │
-│                 Incomplete / NVMe       AWS S3 Bucket                       │
-│                        │               (Multipart Upload)                   │
-│                        ▼                      │                             │
-│                 Completed Files               ▼                             │
-│               (Immediate Local) ─────── Pre-signed S3 URL                   │
-│                                        (Direct Browser Stream)              │
-│                                                                             │
-├─────────────────────────────────────────────────────────────────────────────┤
-│ Infrastructure Containers: PostgreSQL, Redis, Transmission, (Optional MinIO)│
-└─────────────────────────────────────────────────────────────────────────────┘
+                           INTERNET / USER BROWSER
+                                      │
+                                      │ HTTP :80 (No Nginx)
+                                      ▼
+                    ┌───────────────────────────────────┐
+                    │      AWS EC2 (Ubuntu 24.04)       │
+                    │                                   │
+                    │   Node Application Gateway (:80)  │
+                    │   ├── Next.js App Router (UI)     │
+                    │   ├── Express API (/api/*)        │
+                    │   └── Socket.IO (/socket.io/*)    │
+                    │                   │               │
+                    │  Transmission RPC │ (Private)     │
+                    │                   ▼               │
+                    │         Transmission Daemon       │
+                    │     (Peer Port 51413 TCP/UDP)     │
+                    │                   │               │
+                    │                   ▼               │
+                    │             Torrent Swarm         │
+                    │                   │               │
+                    │                   ▼               │
+                    │          EBS Volume Storage       │
+                    │   ├── /incomplete                 │
+                    │   └── /downloads ─────────────────┼───> Immediate HTTP Download
+                    │                   │               │     (/api/torrents/:id/download-local)
+                    │                   ▼               │
+                    │             BullMQ Worker         │
+                    └───────────────────┬───────────────┘
+                                        │ (EC2 IAM Role - Zero keys in .env)
+                                        ▼
+                                    Amazon S3
+                                        │
+                                        ▼
+                                 Pre-signed URL
+                                        │
+                                        ▼
+                                  User Browser
 ```
 
-### AWS S3 Key Enhancements
-1. **Multipart Streaming Uploads (`@aws-sdk/lib-storage`)**:
-   - Supports multi-gigabyte torrent payloads (Linux ISOs, datasets, media) up to **5 TB**.
-   - Streams chunks of 10 MB with 4 concurrent part workers without exhausting host RAM.
-2. **Virtual-Hosted Addressing**:
-   - Uses native `bucket.s3.amazonaws.com` DNS addressing conforming to modern AWS standards.
-3. **S3 Intelligent-Tiering**:
-   - Automatically stores completed torrents in `INTELLIGENT_TIERING` to minimize cloud storage expenses for infrequently accessed archives.
-4. **Server-Side Encryption**:
-   - Automatic `AES256` encryption at rest on AWS S3.
-5. **Pre-signed Download URLs**:
-   - Generated dynamically with configurable expiration (1 hour to 24 hours), avoiding proxying large multi-GB transfers through the Express server.
+### Core Architecture Highlights
+* **Zero Local Swarm Traffic**: All torrent chunk discovery, DHT, PEX, and peer transport run exclusively inside AWS EC2.
+* **Direct Port 80 Serving (NO NGINX)**: Next.js pages, Express REST endpoints (`/api/*`), and Socket.IO WebSockets are served directly through a single Node.js gateway on Port 80 with native WebSocket upgrade handling.
+* **EC2 IAM Role Authentication**: Zero long-lived AWS credentials in `.env`. The AWS SDK Default Credential Provider Chain uses the EC2 instance profile directly.
+* **EBS Storage Isolation**: Active downloading pieces are stored on `/data/transmission/incomplete` and completed files on `/data/transmission/downloads`.
+* **Immediate Local Access**: Completed files can be downloaded immediately from EC2 over HTTP while background BullMQ workers upload to Amazon S3 asynchronously.
+* **Private S3 Objects & Pre-Signed URLs**: S3 objects remain private. Users receive short-lived (15-minute) pre-signed GET URLs for direct cloud downloads.
 
 ---
 
-## 2. AWS S3 Setup & Configuration Guide
+## 2. Public Port & Security Group Rules
 
-### Step 1: Create an S3 Bucket in AWS
-1. Log in to the [AWS Management Console](https://console.aws.amazon.com/s3/).
-2. Click **Create bucket**.
-3. Choose a unique name (e.g. `my-torrent-platform-data`).
-4. Select your preferred region (e.g., `us-east-1` or `eu-west-1`).
-5. Keep **Block all public access** enabled (Pre-signed URLs work securely even with public access blocked).
+Configure your EC2 Security Group with only the minimum required ports:
 
-### Step 2: Configure Bucket CORS
-To allow direct downloads from your web dashboard, add this CORS configuration in your S3 Bucket -> **Permissions** tab:
+| Port | Protocol | Source | Purpose |
+| :--- | :--- | :--- | :--- |
+| **22** | TCP | `My IP` (Recommended) | Secure SSH access |
+| **80** | TCP | `0.0.0.0/0` | Public Web Dashboard & API Gateway |
+| **51413** | TCP | `0.0.0.0/0` | BitTorrent swarm peer connections |
+| **51413** | UDP | `0.0.0.0/0` | BitTorrent DHT and uTP connections |
 
-```json
-[
-  {
-    "AllowedHeaders": ["*"],
-    "AllowedMethods": ["GET", "HEAD"],
-    "AllowedOrigins": [
-      "http://localhost:3000",
-      "http://127.0.0.1:3000"
-    ],
-    "ExposeHeaders": [
-      "ETag",
-      "Content-Length",
-      "Content-Disposition"
-    ],
-    "MaxAgeSeconds": 3600
-  }
-]
+> [!CAUTION]
+> **Never publicly expose internal service ports**:
+> * `5432` (PostgreSQL) — Internal Docker network only
+> * `6379` (Redis) — Internal Docker network only
+> * `9091` (Transmission RPC) — Internal Docker network only
+> * `3000` (Next.js internal) — Proxied through Port 80 Gateway only
+
+---
+
+## 3. Step-by-Step AWS EC2 Deployment Guide
+
+### Step 1: Launch EC2 Instance
+* **OS**: Ubuntu Server 24.04 LTS (64-bit x86 or ARM64).
+* **Instance Type**: `t3.medium` or higher recommended for high-bandwidth swarms (`t3.micro`/`t3.small` can be used for initial testing).
+* **Security Group**: Assign rules for ports `22`, `80`, `51413/tcp`, and `51413/udp`.
+
+### Step 2: Attach & Mount Dedicated EBS Volume
+Attach an Amazon EBS volume (gp3 recommended) to your EC2 instance for torrent payload storage.
+
+```bash
+# 1. List block devices to identify the newly attached volume
+lsblk
+
+# Example output:
+# NAME         MAJ:MIN RM   SIZE RO TYPE MOUNTPOINTS
+# nvme0n1      259:0    0    30G  0 disk /
+# nvme1n1      259:1    0   100G  0 disk   <--- Unformatted EBS volume
+
+# 2. Format the EBS volume with ext4 (replace /dev/nvme1n1 with your disk device)
+sudo mkfs.ext4 -m 1 /dev/nvme1n1
+
+# 3. Retrieve the unique filesystem UUID (Do NOT hardcode device paths)
+sudo blkid /dev/nvme1n1
+# Example output: /dev/nvme1n1: UUID="3fa2b189-93e1-4822-b529-6cf6b17c2f0d" TYPE="ext4"
+
+# 4. Create mount directory
+sudo mkdir -p /data
+
+# 5. Add persistent mount entry to /etc/fstab using UUID
+echo "UUID=3fa2b189-93e1-4822-b529-6cf6b17c2f0d /data ext4 defaults,nofail 0 2" | sudo tee -a /etc/fstab
+
+# 6. Mount volume and verify
+sudo mount -a
+df -h /data
+
+# 7. Create Transmission directories with proper permissions
+sudo mkdir -p /data/transmission/{incomplete,downloads,config}
+sudo chown -R 1000:1000 /data/transmission
 ```
 
-### Step 3: Create an IAM Policy
-Create an IAM user with programmatic access and attach this least-privilege policy:
+### Step 3: Attach IAM Instance Role for S3 Access
+Create an IAM Role with the following least-privilege policy and attach it to your EC2 instance:
 
 ```json
 {
   "Version": "2012-10-17",
   "Statement": [
     {
-      "Sid": "TorrentS3Access",
+      "Sid": "TorrentS3Permissions",
       "Effect": "Allow",
       "Action": [
         "s3:PutObject",
@@ -107,92 +137,135 @@ Create an IAM user with programmatic access and attach this least-privilege poli
         "s3:ListBucket"
       ],
       "Resource": [
-        "arn:aws:s3:::my-torrent-platform-data",
-        "arn:aws:s3:::my-torrent-platform-data/*"
+        "arn:aws:s3:::your-torrent-s3-bucket",
+        "arn:aws:s3:::your-torrent-s3-bucket/*"
       ]
     }
   ]
 }
 ```
 
-### Step 4: Configure `.env`
-In `.env` (copied from `.env.example`):
+> [!NOTE]
+> **S3 CORS**: For standard pre-signed URL downloads (where the browser navigates directly to the link), S3 CORS is **not required**. Configure S3 CORS only if your frontend performs in-browser cross-origin fetch/XHR requests to S3.
 
+### Step 4: Install Docker Engine & Compose on Ubuntu 24.04
+```bash
+# Update package lists
+sudo apt update && sudo apt install -y ca-certificates curl gnupg git
+
+# Install Docker
+sudo install -m 0755 -d /etc/apt/keyrings
+curl -fsSL https://download.docker.com/linux/ubuntu/gpg | sudo gpg --dearmor -o /etc/apt/keyrings/docker.gpg
+sudo chmod a+r /etc/apt/keyrings/docker.gpg
+
+echo \
+  "deb [arch=$(dpkg --print-architecture) signed-by=/etc/apt/keyrings/docker.gpg] https://download.docker.com/linux/ubuntu \
+  $(. /etc/os-release && echo "$VERSION_CODENAME") stable" | \
+  sudo tee /etc/apt/sources.list.d/docker.list > /dev/null
+
+sudo apt update && sudo apt install -y docker-ce docker-ce-cli containerd.io docker-compose-plugin
+
+# Enable Docker for current user
+sudo usermod -aG docker $USER
+newgrp docker
+```
+
+### Step 5: Clone Repository & Configure Environment
+```bash
+git clone https://github.com/SurendiranBJ/Torrent-Downloader.git
+cd Torrent-Downloader
+
+# Copy environment template
+cp .env.example .env
+```
+
+Generate secure production secrets on your EC2 host:
+```bash
+# Generate strong 32-byte hex secrets
+openssl rand -hex 32
+openssl rand -hex 32
+```
+
+Edit `.env`:
 ```env
+PORT=80
+DATABASE_URL=postgresql://postgres:YOUR_DB_PASSWORD@postgres:5432/torrent_db?schema=public
+REDIS_URL=redis://redis:6379
+
+JWT_SECRET=<output from openssl rand>
+JWT_REFRESH_SECRET=<output from openssl rand>
+
 STORAGE_PROVIDER=s3
 AWS_REGION=us-east-1
-AWS_ACCESS_KEY_ID=AKIA...YOUR_AWS_KEY
-AWS_SECRET_ACCESS_KEY=...YOUR_AWS_SECRET
-AWS_S3_BUCKET=my-torrent-platform-data
+S3_BUCKET=your-torrent-s3-bucket
+S3_PREFIX=users/
 AWS_S3_STORAGE_CLASS=INTELLIGENT_TIERING
 ```
 
----
-
-## 3. Windows Setup & Peer Port Networking
-
-Transmission requires port **51413** (TCP & UDP) to achieve uncapped swarm speeds from active seeders.
-
-### Windows Defender Firewall Inbound Rules
-Open PowerShell as **Administrator**:
-
-```powershell
-# TCP peer transfer
-New-NetFirewallRule -DisplayName "Transmission Peer TCP" `
-  -Direction Inbound -LocalPort 51413 -Protocol TCP -Action Allow
-
-# UDP peer transfer (DHT & uTP)
-New-NetFirewallRule -DisplayName "Transmission Peer UDP" `
-  -Direction Inbound -LocalPort 51413 -Protocol UDP -Action Allow
+### Step 6: Launch the Platform
+```bash
+docker compose up -d --build
 ```
 
-### Router Port Forwarding
-* **Automatic (UPnP)**: Supported out of the box via Transmission `port-forwarding-enabled: true`.
-* **Manual Forwarding**: Forward **Port 51413 (TCP/UDP)** from your router's gateway to your Windows machine's IP.
+### Step 7: Verify Running Services
+```bash
+# Verify container health
+docker compose ps
+
+# Check API gateway and Transmission connection
+curl http://localhost/health
+```
+
+Now, open your browser and navigate directly to:
+```text
+http://<EC2_PUBLIC_IP>/
+```
 
 ---
 
-## 4. Running the Platform
+## 4. Transmission Swarm Verification & Diagnostics
 
-### Running with Docker Compose
-```bash
-docker compose up --build -d
-```
-Access points:
-* **Web UI**: [http://localhost:3000](http://localhost:3000)
-* **API Server**: [http://localhost:4000](http://localhost:4000)
+Inside the web dashboard, click **Diagnostics** to review live status:
+* **Peer Port Status**: Confirms whether port `51413` is reachable (`OPEN`, `CLOSED`, or `UNKNOWN`).
+* **Swarm Protocol Discovery**: Displays DHT, PEX, LPD, and uTP status.
+* **Bottleneck Heuristics**: Dynamically categorizes throughput constraints (`NETWORK_LIMITED`, `PEER_CONNECTIVITY_LIMITED`, `TORRENT_SWARM_LIMITED`, `TRANSMISSION_LIMITED`, or `DISK_LIMITED`).
 
-### Running Locally (Bare Metal)
+---
+
+## 5. Benchmarking & Speed Principles
+
+To verify that downloads run strictly inside AWS:
+1. Open the dashboard at `http://<EC2_PUBLIC_IP>/`.
+2. Add an official legal Linux torrent (e.g. Ubuntu Desktop ISO):
+   ```text
+   magnet:?xt=urn:btih:e6bb925d2b7c4a17ab8cf8073fa8ff4d34eb5de0
+   ```
+3. Observe live network traffic:
+   * **Your Local Windows PC**: Network monitor will show near **0 KB/s** BitTorrent traffic.
+   * **AWS EC2**: Downloads at multi-megabyte/gigabit speeds directly from the swarm to the attached EBS storage.
+4. When download reaches **100%**:
+   * Click **Download File** to immediately stream the completed file from EC2/EBS over HTTP.
+   * In the background, BullMQ asynchronously offloads the file to Amazon S3. Once ready, clicking download generates a 15-minute pre-signed S3 URL.
+
+---
+
+## 6. AWS Cost Awareness
+
+Running cloud infrastructure on AWS can incur charges. Be aware of the following:
+* **EC2 Compute**: Billed per hour/second depending on the instance size.
+* **EBS Volume**: Billed per GB-month of provisioned storage (gp3).
+* **Amazon S3 Storage**: Billed per GB-month. Using `INTELLIGENT_TIERING` reduces long-term archive costs.
+* **Data Transfer (Egress)**: Inbound data transfer from the torrent swarm to EC2 is **free**. Outbound data transfer from EC2/S3 to your browser incurs standard AWS egress charges.
+
+---
+
+## 7. Local Testing & Verification
+
+Run all test suites locally:
 ```bash
-# 1. Install dependencies
 npm install
-
-# 2. Build shared package
 npm run build --workspace=@torrent-platform/shared
-
-# 3. Generate Prisma client & build API
 npm run build --workspace=@torrent-platform/api
-
-# 4. Build Next.js Web Frontend
 npm run build --workspace=@torrent-platform/web
-
-# 5. Run Automated Tests
 npm test --workspace=@torrent-platform/api
 ```
-
----
-
-## 5. Automated Tests
-
-Run the test suite verifying Transmission, State Machine, S3 Worker, Metrics, and Multi-Tenant Isolation:
-
-```bash
-npm test --workspace=@torrent-platform/api
-```
-
-All test suites:
-* `transmission.test.ts`: Magnet links, .torrent files, session stats, port-test mapping.
-* `isolation.test.ts`: Multi-tenant user isolation.
-* `storageWorker.test.ts`: Multipart S3 upload, retries, and pre-signed URL validation.
-* `stateMachine.test.ts`: Status transitions (`queued` -> `downloading` -> `completed` -> `seeding` -> `uploading` -> `ready`).
-* `metrics.test.ts`: Bandwidth calculations and ETA.

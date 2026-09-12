@@ -8,9 +8,10 @@ services:
     environment:
       POSTGRES_DB: torrent_db
       POSTGRES_USER: postgres
-      POSTGRES_PASSWORD: postgrespassword
-    ports:
-      - "5432:5432"
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-postgrespassword}
+    # Internal only — NOT exposed publicly to the Internet
+    expose:
+      - "5432"
     volumes:
       - postgres_data:/var/lib/postgresql/data
     healthcheck:
@@ -23,8 +24,9 @@ services:
     image: redis:7-alpine
     container_name: torrent-redis
     restart: unless-stopped
-    ports:
-      - "6379:6379"
+    # Internal only — NOT exposed publicly to the Internet
+    expose:
+      - "6379"
     volumes:
       - redis_data:/data
     healthcheck:
@@ -32,39 +34,6 @@ services:
       interval: 5s
       timeout: 5s
       retries: 5
-
-  minio:
-    image: minio/minio:latest
-    container_name: torrent-minio
-    restart: unless-stopped
-    command: server /data --console-address ":9001"
-    environment:
-      MINIO_ROOT_USER: minioadmin
-      MINIO_ROOT_PASSWORD: minioadmin
-    ports:
-      - "9000:9000"
-      - "9001:9001"
-    volumes:
-      - minio_data:/data
-    healthcheck:
-      test: ["CMD", "curl", "-f", "http://localhost:9000/minio/health/live"]
-      interval: 5s
-      timeout: 5s
-      retries: 5
-
-  createbuckets:
-    image: minio/mc:latest
-    container_name: torrent-createbuckets
-    depends_on:
-      minio:
-        condition: service_healthy
-    entrypoint: >
-      /bin/sh -c "
-      /usr/bin/mc alias set myminio http://minio:9000 minioadmin minioadmin;
-      /usr/bin/mc mb myminio/torrent-completed || true;
-      /usr/bin/mc anonymous set download myminio/torrent-completed;
-      exit 0;
-      "
 
   transmission:
     image: lscr.io/linuxserver/transmission:latest
@@ -80,51 +49,13 @@ services:
     volumes:
       - ./data/transmission/downloads:/downloads
       - ./data/transmission/incomplete:/incomplete
-      - transmission_config:/config
+      - ./data/transmission/config:/config
+    # Only peer ports are exposed publicly; RPC port 9091 is internal only
+    expose:
+      - "9091"
     ports:
-      - "9091:9091"
       - "${TRANSMISSION_PEER_PORT:-51413}:${TRANSMISSION_PEER_PORT:-51413}/tcp"
       - "${TRANSMISSION_PEER_PORT:-51413}:${TRANSMISSION_PEER_PORT:-51413}/udp"
-
-  api:
-    build:
-      context: .
-      dockerfile: apps/api/Dockerfile
-    container_name: torrent-api
-    restart: unless-stopped
-    environment:
-      NODE_ENV: production
-      PORT: 4000
-      DATABASE_URL: postgresql://postgres:postgrespassword@postgres:5432/torrent_db?schema=public
-      REDIS_URL: redis://redis:6379
-      JWT_SECRET: super-secret-jwt-key-replace-in-production-min-32-chars
-      JWT_REFRESH_SECRET: super-secret-jwt-refresh-key-replace-in-production-min-32-chars
-      TRANSMISSION_HOST: transmission
-      TRANSMISSION_RPC_PORT: 9091
-      TRANSMISSION_PEER_PORT: ${TRANSMISSION_PEER_PORT:-51413}
-      # Storage Provider: "s3" for AWS S3 or "minio" for local container
-      STORAGE_PROVIDER: ${STORAGE_PROVIDER:-s3}
-      AWS_REGION: ${AWS_REGION:-us-east-1}
-      AWS_ACCESS_KEY_ID: ${AWS_ACCESS_KEY_ID:-}
-      AWS_SECRET_ACCESS_KEY: ${AWS_SECRET_ACCESS_KEY:-}
-      AWS_S3_BUCKET: ${AWS_S3_BUCKET:-torrent-completed}
-      AWS_S3_STORAGE_CLASS: ${AWS_S3_STORAGE_CLASS:-INTELLIGENT_TIERING}
-      STORAGE_ENDPOINT: ${STORAGE_ENDPOINT:-}
-      STORAGE_BUCKET: ${STORAGE_BUCKET:-torrent-completed}
-      STORAGE_ACCESS_KEY: ${STORAGE_ACCESS_KEY:-minioadmin}
-      STORAGE_SECRET_KEY: ${STORAGE_SECRET_KEY:-minioadmin}
-      DOWNLOAD_DIR: /downloads
-      INCOMPLETE_DIR: /incomplete
-    ports:
-      - "4000:4000"
-    volumes:
-      - ./data/transmission/downloads:/downloads
-      - ./data/transmission/incomplete:/incomplete
-    depends_on:
-      postgres:
-        condition: service_healthy
-      redis:
-        condition: service_healthy
 
   web:
     build:
@@ -135,14 +66,52 @@ services:
     environment:
       NODE_ENV: production
       PORT: 3000
-      NEXT_PUBLIC_API_URL: http://localhost:4000
+      # Internal API communication
+      NEXT_PUBLIC_API_URL: ""
+    # Internal only — served publicly via the Port 80 Node Gateway
+    expose:
+      - "3000"
+
+  api:
+    build:
+      context: .
+      dockerfile: apps/api/Dockerfile
+    container_name: torrent-api
+    restart: unless-stopped
+    environment:
+      NODE_ENV: production
+      # Direct Port 80 Node Gateway
+      PORT: 80
+      WEB_URL: http://web:3000
+      DATABASE_URL: postgresql://postgres:${POSTGRES_PASSWORD:-postgrespassword}@postgres:5432/torrent_db?schema=public
+      REDIS_URL: redis://redis:6379
+      JWT_SECRET: ${JWT_SECRET}
+      JWT_REFRESH_SECRET: ${JWT_REFRESH_SECRET}
+      TRANSMISSION_HOST: transmission
+      TRANSMISSION_RPC_PORT: 9091
+      TRANSMISSION_PEER_PORT: ${TRANSMISSION_PEER_PORT:-51413}
+      # AWS S3 Storage (Default Credential Provider Chain uses EC2 IAM Role)
+      STORAGE_PROVIDER: ${STORAGE_PROVIDER:-s3}
+      AWS_REGION: ${AWS_REGION:-us-east-1}
+      S3_BUCKET: ${S3_BUCKET:-my-torrent-bucket}
+      S3_PREFIX: ${S3_PREFIX:-users/}
+      AWS_S3_STORAGE_CLASS: ${AWS_S3_STORAGE_CLASS:-INTELLIGENT_TIERING}
+      DOWNLOAD_DIR: /downloads
+      INCOMPLETE_DIR: /incomplete
+    # Publicly exposed on Port 80
     ports:
-      - "3000:3000"
+      - "${PORT:-80}:80"
+    volumes:
+      - ./data/transmission/downloads:/downloads
+      - ./data/transmission/incomplete:/incomplete
     depends_on:
-      - api
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+      web:
+        condition: service_started
 
 volumes:
   postgres_data:
   redis_data:
-  minio_data:
-  transmission_config:

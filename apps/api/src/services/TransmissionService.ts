@@ -99,11 +99,15 @@ export class TransmissionService {
       const portForwarding = (process.env.TRANSMISSION_PORT_FORWARDING_ENABLED || 'true').toLowerCase() === 'true';
       const cacheSizeMb = parseInt(process.env.TRANSMISSION_CACHE_SIZE_MB || '64', 10);
 
-      const downloadDir = path.resolve(process.env.DOWNLOAD_DIR || './data/transmission/downloads');
-      const incompleteDir = path.resolve(process.env.INCOMPLETE_DIR || './data/transmission/incomplete');
+      const downloadDir = process.env.DOWNLOAD_DIR || (process.platform === 'win32' ? path.resolve('./data/transmission/downloads') : '/downloads');
+      const incompleteDir = process.env.INCOMPLETE_DIR || (process.platform === 'win32' ? path.resolve('./data/transmission/incomplete') : '/incomplete');
 
-      if (!fs.existsSync(downloadDir)) fs.mkdirSync(downloadDir, { recursive: true });
-      if (!fs.existsSync(incompleteDir)) fs.mkdirSync(incompleteDir, { recursive: true });
+      if (!fs.existsSync(downloadDir)) {
+        try { fs.mkdirSync(downloadDir, { recursive: true }); } catch {}
+      }
+      if (!fs.existsSync(incompleteDir)) {
+        try { fs.mkdirSync(incompleteDir, { recursive: true }); } catch {}
+      }
 
       const settings: TransmissionSessionConfig = {
         'peer-port': peerPort,

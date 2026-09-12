@@ -56,8 +56,8 @@ describe('StorageWorker', () => {
 
     const result = await worker.processUploadJob(mockJob);
 
-    expect(result.storageKey).toBe('torrents/user-1/hash-1/' + path.basename(tempTestFile));
-    expect(mockStorageService.upload).toHaveBeenCalledWith(tempTestFile, expect.stringContaining('hash-1'));
+    expect(result.storageKey).toBe('users/user-1/torrents/torrent-1/' + path.basename(tempTestFile));
+    expect(mockStorageService.upload).toHaveBeenCalledWith(tempTestFile, expect.stringContaining('torrent-1'));
     expect(mockStorageService.getSignedUrl).toHaveBeenCalled();
 
     // Verify DB state updates

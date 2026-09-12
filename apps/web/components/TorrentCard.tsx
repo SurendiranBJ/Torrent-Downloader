@@ -132,9 +132,8 @@ export function TorrentCard({ torrent, onRefresh }: TorrentCardProps) {
         if (res.type === 's3' || res.downloadUrl.startsWith('http')) {
           window.open(res.downloadUrl, '_blank');
         } else {
-          // Local download
-          const apiBase = process.env.NEXT_PUBLIC_API_URL || 'http://localhost:4000';
-          window.open(`${apiBase}${res.downloadUrl}`, '_blank');
+          // Local download through port 80 gateway
+          window.open(res.downloadUrl, '_blank');
         }
       }
     } catch (err: any) {

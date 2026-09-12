@@ -1,5 +1,4 @@
 import fs from 'fs';
-import path from 'path';
 import {
   S3Client,
   GetObjectCommand,
@@ -31,6 +30,7 @@ export class StorageService {
   constructor(options?: StorageConfig) {
     this.bucket =
       options?.bucket ||
+      process.env.S3_BUCKET ||
       process.env.AWS_S3_BUCKET ||
       process.env.STORAGE_BUCKET ||
       'torrent-completed';
@@ -38,7 +38,7 @@ export class StorageService {
     const provider =
       options?.provider ||
       (process.env.STORAGE_PROVIDER as 's3' | 'minio' | 'r2') ||
-      (process.env.AWS_S3_BUCKET ? 's3' : 'minio');
+      's3';
 
     const explicitEndpoint = options?.endpoint || process.env.STORAGE_ENDPOINT;
     this.isNativeAws =
@@ -50,47 +50,51 @@ export class StorageService {
       process.env.STORAGE_REGION ||
       'us-east-1';
 
+    // When running on AWS EC2 with an IAM role, accessKey and secretKey are empty.
+    // In that case, credentials remain undefined so the AWS SDK default credential
+    // provider chain automatically discovers the EC2 IAM Instance Profile.
     const accessKeyId =
       options?.accessKey ||
       process.env.AWS_ACCESS_KEY_ID ||
       process.env.STORAGE_ACCESS_KEY ||
-      'minioadmin';
+      '';
 
     const secretAccessKey =
       options?.secretKey ||
       process.env.AWS_SECRET_ACCESS_KEY ||
       process.env.STORAGE_SECRET_KEY ||
-      'minioadmin';
+      '';
 
     const storageClassEnv = (process.env.AWS_S3_STORAGE_CLASS ||
       process.env.STORAGE_CLASS) as StorageClass | undefined;
-    this.defaultStorageClass = options?.storageClass || storageClassEnv || 'STANDARD';
+    this.defaultStorageClass = options?.storageClass || storageClassEnv || 'INTELLIGENT_TIERING';
 
     if (options?.clientInstance) {
       this.s3Client = options.clientInstance;
       return;
     }
 
-    // Configure S3 Client according to target (AWS S3 vs MinIO/Local)
+    const hasExplicitCredentials = !!(accessKeyId.trim() && secretAccessKey.trim());
+
     this.s3Client = new S3Client({
       region,
       ...(this.isNativeAws
         ? {
-            // Native AWS S3: Virtual-hosted style addressing (e.g. bucket.s3.amazonaws.com)
+            // Native AWS S3 uses standard virtual-hosted DNS
             forcePathStyle: false
           }
         : {
-            // Local MinIO or R2: Custom endpoint with path-style addressing
+            // Local MinIO or S3-compatible custom endpoint
             endpoint: explicitEndpoint || 'http://localhost:9000',
             forcePathStyle: true
           }),
-      credentials:
-        accessKeyId && secretAccessKey
-          ? {
-              accessKeyId,
-              secretAccessKey
-            }
-          : undefined
+      // If credentials are provided, use them; otherwise use EC2 IAM role
+      credentials: hasExplicitCredentials
+        ? {
+            accessKeyId,
+            secretAccessKey
+          }
+        : undefined
     });
   }
 
@@ -111,19 +115,18 @@ export class StorageService {
         err.$metadata?.httpStatusCode === 404 ||
         err.name === 'NoSuchBucket'
       ) {
-        // Only attempt automatic bucket creation if permitted (primarily for local MinIO / dev)
+        // Attempt automatic bucket creation if permissible (primarily for local dev)
         try {
           await this.s3Client.send(new CreateBucketCommand({ Bucket: this.bucket }));
-        } catch (createErr) {
-          console.warn(`Note: Could not auto-create bucket "${this.bucket}". Ensure it exists in your AWS S3 console.`);
+        } catch {
+          console.warn(`Note: Ensure bucket "${this.bucket}" exists in your AWS S3 account.`);
         }
       }
     }
   }
 
   /**
-   * High-throughput Multipart Upload for Multi-Gigabyte Torrents
-   * Supports files up to 5 TB with 10MB chunked concurrency
+   * Multipart Streaming Upload for Multi-Gigabyte Torrents
    */
   public async upload(
     filePath: string,
@@ -135,7 +138,6 @@ export class StorageService {
 
     await this.ensureBucket();
 
-    // Use AWS Multipart Streaming Upload
     const parallelUpload = new Upload({
       client: this.s3Client,
       params: {
@@ -146,8 +148,8 @@ export class StorageService {
         StorageClass: this.isNativeAws ? this.defaultStorageClass : undefined,
         ServerSideEncryption: this.isNativeAws ? ('AES256' as ServerSideEncryption) : undefined
       },
-      queueSize: 4, // 4 concurrent part uploads
-      partSize: 10 * 1024 * 1024, // 10 MB chunk size
+      queueSize: 4,
+      partSize: 10 * 1024 * 1024, // 10 MB chunks
       leavePartsOnError: false
     });
 
@@ -170,9 +172,9 @@ export class StorageService {
   }
 
   /**
-   * Generates a pre-signed AWS S3 download URL
+   * Generates a secure pre-signed GET URL (default 15 minutes / 900 seconds)
    */
-  public async getSignedUrl(key: string, expiresIn = 3600): Promise<string> {
+  public async getSignedUrl(key: string, expiresIn = 900): Promise<string> {
     const command = new GetObjectCommand({
       Bucket: this.bucket,
       Key: key
